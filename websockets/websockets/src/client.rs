@@ -12,6 +12,9 @@ use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+// TODO: Handle append, backspace and splice messages from the client and
+// increment spam score accordingly
+
 // Public key public and private ID set
 #[derive(Clone)]
 struct PubKeyDesc {
@@ -147,13 +150,16 @@ impl Client {
 					return Ok(());
 				}
 				Some(t) => {
+					use ConnState::*;
+					use MessageType::*;
+
 					#[rustfmt::skip]
 					macro_rules! expect {
-						($type:ident) => {
-							if t != MessageType::$type {
+						($type:tt) => {
+							if t != $type {
 								str_err!(concat!(
 									"expected ",
-									stringify!(MessageType::$type)
+									stringify!($type)
 								));
 							}
 						};
@@ -161,25 +167,24 @@ impl Client {
 
 					first = false;
 					match &self.conn_state {
-						ConnState::Connected => {
+						Connected => {
 							expect!(Handshake);
 							self.handle_handshake(&mut dec)?;
 						}
-						ConnState::RequestedReshake { desc, pub_key } => {
+						RequestedReshake { desc, pub_key } => {
 							expect!(Handshake);
 							let desc = desc.clone();
 							let pub_key = pub_key.clone();
 							self.handle_reshake(&mut dec, desc, pub_key)?;
 						}
-						ConnState::AcceptedHandshake(desc) => {
+						AcceptedHandshake(desc) => {
 							expect!(Synchronize);
 							let feed = dec.read_next()?;
 							log_msg_in!(MessageType::Synchronize, feed);
-							self.conn_state =
-								ConnState::Synchronizing(desc.clone());
+							self.conn_state = Synchronizing(desc.clone());
 							self.synchronize(feed)?;
 						}
-						ConnState::Synchronizing(_) => route! { t,
+						Synchronizing(_) => route! { t,
 							CreateThread => |req: ThreadCreationReq| {
 								self.create_thread(req)
 							}
@@ -251,11 +256,18 @@ impl Client {
 		}
 		self.check_captcha(&req.captcha_solution)?;
 
+		// TODO: increment spam score
+
 		let id = bindings::insert_thread(
 			&req.subject,
 			&req.tags,
 			self.public_key_id()?,
+			Self::empty_body_json(),
 		)?;
+
+		// Ensures old post non-existence records do not persist indefinitely.
+		crate::body::cache_location(id, id, 0);
+
 		pulsar::create_thread(protocol::payloads::ThreadCreationNotice {
 			id: id,
 			subject: req.subject,
@@ -264,6 +276,28 @@ impl Client {
 
 		self.send(MessageType::CreateThreadAck, &id)?;
 		Ok(())
+	}
+
+	// Cached empty body JSON representation
+	//
+	// Non-useless const fn when?
+	fn empty_body_json() -> &'static [u8] {
+		use std::sync::Once;
+
+		static ONCE: Once = Once::new();
+		static mut BODY: Option<Vec<u8>> = None;
+		ONCE.call_once(|| {
+			unsafe {
+				BODY = Some(
+					serde_json::to_vec(
+						&protocol::payloads::post_body::Node::Empty,
+					)
+					.expect("failed to generate empty body JSON"),
+				)
+			};
+		});
+
+		unsafe { BODY.as_ref().unwrap() }
 	}
 
 	// Get public key private ID, if client is synchronized

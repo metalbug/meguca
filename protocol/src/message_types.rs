@@ -36,4 +36,7 @@ pub enum MessageType {
 
 	// Notify client a captcha is required for a previously attempted request
 	NeedCaptcha,
+
+	// Apply a patch to an existing post body
+	PatchPostBody,
 }

@@ -1,18 +1,26 @@
-use super::common::DynResult;
-use super::{bindings, registry};
+use crate::{bindings, common::DynResult, registry};
 use protocol::{
 	debug_log,
 	payloads::{FeedData, Image, ThreadCreationNotice},
+	util::SetMap,
 	Encoder, MessageType,
 };
 use rayon::prelude::*;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
-use std::sync::{
-	mpsc::{channel, SendError, Sender},
-	Arc, Mutex,
+use std::{
+	collections::{HashMap, HashSet},
+	sync::{
+		mpsc::{channel, SendError, Sender},
+		Arc, Mutex,
+	},
+	time::{Duration, Instant, SystemTime},
 };
-use std::time::{Duration, Instant, SystemTime};
+
+// TODO: Asynchronously lookup all unresolved post links during post body
+// reparse as to not block pulsar
+// TODO: Asynchronously queue body writes to one second batches
+// TODO: Ensure closed post body writes are synchronous and asynchronous open
+// body writes do not override them. (use recently closed post ID map)
 
 // For sending requests to Pulsar. Clone to use.
 static mut REQUEST: Option<Mutex<Sender<Request>>> = None;
@@ -45,20 +53,22 @@ pub fn init(feed_data: &[u8]) -> DynResult {
 
 				// Process all pending requests
 				for req in recv.try_iter() {
-					if let Err(err) = match &req {
-						Request::CreateThread(data) => p.create_thread(data),
-						Request::RemoveThread(id) => {
-							p.remove_thread(*id);
-							Ok(())
-						}
-						Request::InsertImage(req) => {
-							p.insert_image(req);
-							Ok(())
-						}
-					} {
+					use Request::*;
+
+					if let Err(err) = || -> DynResult<()> {
+						match req {
+							CreateThread(data) => p.create_thread(data)?,
+							RemoveThread(id) => p.remove_thread(id),
+							InsertImage(req) => p.insert_image(req),
+							SetOpenBody { post, thread, body } => {
+								p.enqueue_open_body(post, thread, body)
+							}
+						};
+						Ok(())
+					}() {
 						bindings::log_error(&format!(
-							"pulsar: request={:?} error={:?}",
-							req, err
+							"pulsar: error={:?}",
+							err
 						));
 					}
 				}
@@ -151,6 +161,9 @@ struct Feed {
 
 	// Current active feed data.
 	data: FeedData,
+
+	// Open bodies pending parsing and diffing
+	pending_open_bodies: HashMap<u64, String>,
 }
 
 // Get or init new Encoder and return it
@@ -191,6 +204,7 @@ impl Feed {
 			pending_global: None,
 			last_5_posts: l5,
 			data: data,
+			pending_open_bodies: Default::default(),
 		}
 	}
 
@@ -306,6 +320,43 @@ impl Feed {
 			encode!(self.pending_global);
 		}
 	}
+
+	// Diff pending open post body changes in parallel and write messages to
+	// encoders
+	fn diff_open_bodies(&mut self) {
+		use protocol::payloads::post_body::{Node, PatchNode};
+
+		for (id, patch, new) in self
+			.pending_open_bodies
+			.drain()
+			.collect::<Vec<(u64, String)>>()
+			.into_par_iter()
+			.filter_map(|(id, s)| -> Option<(u64, PatchNode, Node)> {
+				use crate::body::{diff, parse};
+
+				let old = match self.data.open_posts.get(&id) {
+					Some(p) => &p.body,
+					// Post already closed
+					None => return None,
+				};
+				let new = match parse(&s, true) {
+					Ok(n) => n,
+					Err(e) => {
+						bindings::log_error(&format!(
+							"body parsing error on post {}: {}",
+							id, e
+						));
+						return None;
+					}
+				};
+				diff(&old, &new).map(|p| (id, p, new))
+			})
+			.collect::<Vec<(u64, PatchNode, Node)>>()
+		{
+			self.data.open_posts.get_mut(&id).unwrap().body = new;
+			self.encode_post_message(id, MessageType::PatchPostBody, &patch);
+		}
+	}
 }
 
 // Reusable message buffer wrapper with AsRef[u8]
@@ -342,6 +393,21 @@ impl Into<Arc<Vec<u8>>> for Msg {
 	}
 }
 
+// Used for aggregation of messages in parallel
+#[derive(Default)]
+struct MessageSet {
+	// Each aggregated into one message for I/O efficiency after the
+	// main filter_map(). Doing it inside would create too much
+	// nesting and require more reallocations.
+	global_init_parts: Vec<Msg>,
+	global_feed_messages: Vec<Vec<u8>>,
+
+	// Aggregated into one message for I/O efficiency inside the main
+	// filter_map(), as most of the time, global messages will not be
+	// concatenated with them.
+	thread_messages: HashMap<u64, Msg>,
+}
+
 // Buffering update dispatcher singleton.
 //
 // Never access Pulsar from the Registry, as Pulsar accesses it. Can result in
@@ -368,7 +434,7 @@ impl Pulsar {
 	// Register a new thread and allocate its resources
 	fn create_thread(
 		&mut self,
-		data: &ThreadCreationNotice,
+		data: ThreadCreationNotice,
 	) -> std::io::Result<()> {
 		self.global.clear_cache();
 
@@ -381,7 +447,7 @@ impl Pulsar {
 		self.feeds.insert(data.id, f);
 
 		get_encoder(&mut self.global.pending)
-			.write_message(MessageType::CreateThread, data)
+			.write_message(MessageType::CreateThread, &data)
 	}
 
 	// Deallocate thread resources and redirect all of its clients
@@ -416,7 +482,7 @@ impl Pulsar {
 	}
 
 	// Insert an image into an allocated post
-	fn insert_image(&mut self, req: &ImageInsertionReq) {
+	fn insert_image(&mut self, req: ImageInsertionReq) {
 		self.mod_thread(req.thread, |f| {
 			match f.data.open_posts.get_mut(&req.post) {
 				Some(p) => {
@@ -438,6 +504,13 @@ impl Pulsar {
 		})
 	}
 
+	// Enqueue open body for parsing and diffing on next pulse
+	fn enqueue_open_body(&mut self, post: u64, thread: u64, body: String) {
+		self.mod_thread(thread, |f| {
+			f.pending_open_bodies.insert(post, body);
+		});
+	}
+
 	// Clean up expired recent posts
 	fn clean_up(&mut self) {
 		let threshold = (SystemTime::now() - Duration::from_secs(60 * 15))
@@ -451,6 +524,7 @@ impl Pulsar {
 		})
 	}
 
+	// Generate, aggregate and send buffered messages to clients
 	fn send_messages(&mut self) {
 		// TODO: Make client filter recent posts by creation timestamp to the
 		// last 15 min
@@ -473,32 +547,83 @@ impl Pulsar {
 			}
 		});
 
-		// Used for aggregation of messages in parallel
-		#[derive(Default)]
-		struct MessageSet {
-			// Each aggregated into one message for I/O efficiency after the
-			// main filter_map(). Doing it inside would create too much
-			// nesting and require more reallocations.
-			global_init_parts: Vec<Msg>,
-			global_feed_messages: Vec<Vec<u8>>,
+		let messages = self.aggregate_feed_messages(
+			!self.global.need_init.is_empty()
+				&& self.global.init_msg_cache.is_none(),
+			&clients_by_feed,
+		);
 
-			// Aggregated into one message for I/O efficiency inside the main
-			// filter_map(), as most of the time, global messages will not be
-			// concatenated with them.
-			thread_messages: HashMap<u64, Msg>,
+		let mut messages_by_client = HashMap::new();
+		// Assign thread feed messages to all thread feed clients
+		for (thread, msg) in messages.thread_messages {
+			if let Some(clients) = clients_by_feed.get(&thread) {
+				for c in clients {
+					messages_by_client.insert(*c, msg.clone());
+				}
+			}
+		}
+		self.assign_global_feed_messages(
+			messages.global_init_parts,
+			messages.global_feed_messages,
+			clients_by_feed.get(&0),
+			&mut messages_by_client,
+		);
+
+		// Merge server-wide messages to all clients.
+		// Not very efficient, but that is fine. These happen rarely.
+		if let Some(pending) = self.global.pending.take() {
+			match pending.finish() {
+				Ok(buf) => {
+					messages_by_client.par_iter_mut().for_each(
+						|(_, queued)| {
+							*queued = Msg::new(Encoder::join(&[
+								queued.as_ref(),
+								buf.as_ref(),
+							]));
+						},
+					);
+					let msg = Msg::new(buf);
+					for c in all_clients
+						.iter()
+						.filter(|c| !messages_by_client.contains_key(&c))
+						.copied()
+						.collect::<Vec<_>>()
+					{
+						messages_by_client.insert(c, msg.clone());
+					}
+				}
+				Err(err) => self.global.log_encode_error(err),
+			};
 		}
 
-		let build_global_init = !self.global.need_init.is_empty()
-			&& self.global.init_msg_cache.is_none();
+		// Send all messages in parallel to maximize parallelism of the Go side
+		messages_by_client
+			.into_par_iter()
+			.for_each(|(client, msg)| {
+				bindings::write_message(client, msg.into());
+			})
+	}
 
-		// Aggregate feed messages to send
-		let mut messages: MessageSet = self
-			.feeds
+	// Aggregate feed messages to send for all thread feeds and the global feed
+	fn aggregate_feed_messages(
+		&mut self,
+		build_global_init: bool,
+		clients_by_feed: &SetMap<u64, u64>,
+	) -> MessageSet {
+		self.feeds
 			.par_iter_mut()
 			.filter_map(|(id, f)| -> Option<MessageSet> {
-				if !build_global_init && f.common.need_init.is_empty() {
+				if !build_global_init
+					&& f.common.need_init.is_empty()
+					&& clients_by_feed.get(id).is_none()
+				{
 					return None;
 				}
+
+				// Compute splice messages from stored post body.
+				// string pairs first as those can append to pending message
+				// encoders.
+				f.diff_open_bodies();
 
 				#[rustfmt::skip]
 				macro_rules! try_encode {
@@ -567,11 +692,6 @@ impl Pulsar {
 				// disconnecting
 				f.common.need_init.clear();
 
-				// TODO: Compute splice messages from stored post body
-				// string pairs before regenerating init messages.
-				// TODO: Parallelize not only on threads, but also on splice
-				// pairs
-
 				Some(MessageSet {
 					thread_messages: thread_messages,
 					global_init_parts: if build_global_init {
@@ -587,24 +707,46 @@ impl Pulsar {
 			})
 			.reduce(
 				|| Default::default(),
-				|mut a, b| {
-					a.global_init_parts.extend(b.global_init_parts);
-					a.global_feed_messages.extend(b.global_feed_messages);
-					a.thread_messages.extend(b.thread_messages);
+				|mut a, mut b| {
+					#[rustfmt::skip]
+					macro_rules! merge {
+						($($key:ident),+) => {
+							$(
+								// Extend the bigger collection
+								if b.$key.capacity() > a.$key.capacity()  {
+									std::mem::swap(&mut a.$key, &mut b.$key);
+								}
+								a.$key.extend(b.$key);
+							)+
+						};
+					}
+
+					merge!(
+						global_init_parts,
+						global_feed_messages,
+						thread_messages
+					);
 					a
 				},
-			);
+			)
+	}
 
-		let mut messages_by_client = messages.thread_messages;
-
+	// Assign global feed messages to clients on the global feed
+	fn assign_global_feed_messages(
+		&mut self,
+		mut global_init_parts: Vec<Msg>,
+		global_feed_messages: Vec<Vec<u8>>,
+		global_clients: Option<&HashSet<u64>>,
+		messages_by_client: &mut HashMap<u64, Msg>,
+	) {
 		// Assign global feed messages to clients
 		match (
-			!messages.global_init_parts.is_empty(),
-			!messages.global_feed_messages.is_empty(),
-			clients_by_feed.get(&0),
+			!global_init_parts.is_empty(),
+			!global_feed_messages.is_empty(),
+			global_clients,
 		) {
 			(true, false, Some(clients)) => {
-				let msg = Msg::new(Encoder::join(messages.global_init_parts));
+				let msg = Msg::new(Encoder::join(global_init_parts));
 				for c in self
 					.global
 					.need_init
@@ -615,13 +757,11 @@ impl Pulsar {
 				}
 			}
 			(true, true, Some(clients)) => {
-				let single =
-					Msg::new(Encoder::join(messages.global_feed_messages));
+				let single = Msg::new(Encoder::join(global_feed_messages));
 				// Init messages should be sent first to maintain
 				// event sequentiality
-				messages.global_init_parts.push(single.clone());
-				let with_init =
-					Msg::new(Encoder::join(messages.global_init_parts));
+				global_init_parts.push(single.clone());
+				let with_init = Msg::new(Encoder::join(global_init_parts));
 
 				for c in clients.iter().cloned() {
 					messages_by_client.insert(
@@ -635,8 +775,7 @@ impl Pulsar {
 				}
 			}
 			(false, true, Some(clients)) => {
-				let msg =
-					Msg::new(Encoder::join(messages.global_feed_messages));
+				let msg = Msg::new(Encoder::join(global_feed_messages));
 				for c in clients.iter().cloned() {
 					messages_by_client.insert(c, msg.clone());
 				}
@@ -646,40 +785,6 @@ impl Pulsar {
 		// Always clear clients needing init, as they were either handled above
 		// or ignored due to navigating away or disconnecting
 		self.global.need_init.clear();
-
-		// Merge server-wide messages to all clients.
-		// Not very efficient, but that is fine. These happen rarely.
-		if let Some(pending) = self.global.pending.take() {
-			match pending.finish() {
-				Ok(buf) => {
-					messages_by_client.par_iter_mut().for_each(
-						|(_, queued)| {
-							*queued = Msg::new(Encoder::join(&[
-								queued.as_ref(),
-								buf.as_ref(),
-							]));
-						},
-					);
-					let msg = Msg::new(buf);
-					for c in all_clients
-						.iter()
-						.filter(|c| !messages_by_client.contains_key(&c))
-						.cloned()
-						.collect::<Vec<_>>()
-					{
-						messages_by_client.insert(c, msg.clone());
-					}
-				}
-				Err(err) => self.global.log_encode_error(err),
-			};
-		}
-
-		// Send all messages in parallel to maximize parallelism of the Go side
-		messages_by_client
-			.into_par_iter()
-			.for_each(|(client, msg)| {
-				bindings::write_message(client, msg.into());
-			})
 	}
 }
 
@@ -701,6 +806,13 @@ pub enum Request {
 
 	// Insert an image into an allocated post
 	InsertImage(ImageInsertionReq),
+
+	// Set the body of an open post
+	SetOpenBody {
+		post: u64,
+		thread: u64,
+		body: String,
+	},
 }
 
 // Alias Result for sending a request to Pulsar
@@ -718,6 +830,11 @@ pub fn create_thread(data: ThreadCreationNotice) -> SendResult {
 // Deallocate thread resources and redirect all of its clients
 pub fn remove_thread(id: u64) -> SendResult {
 	send_request(Request::RemoveThread(id))
+}
+
+// Set the body of an open post
+pub fn set_open_body(post: u64, thread: u64, body: String) -> SendResult {
+	send_request(Request::SetOpenBody { post, thread, body })
 }
 
 // Insert an image into an allocated post

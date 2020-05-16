@@ -91,7 +91,7 @@ payload! { OpenPost {
 	image_spoilered: bool,
 	created_on: u32,
 	thread: u64,
-	body: Option<post_body::Node>,
+	body: post_body::Node,
 }}
 
 impl OpenPost {
@@ -101,7 +101,7 @@ impl OpenPost {
 			thread,
 			has_image: Default::default(),
 			image_spoilered: Default::default(),
-			body: Default::default(),
+			body: post_body::Node::Empty,
 		}
 	}
 }
@@ -156,27 +156,29 @@ pub enum FileType {
 impl FileType {
 	// Return canonical extension for file type
 	pub fn extension(&self) -> &'static str {
+		use FileType::*;
+
 		match self {
-			Self::JPEG => "jpg",
-			Self::PNG => "png",
-			Self::GIF => "gif",
-			Self::WEBP => "webp",
-			Self::MP3 => "mp3",
-			Self::MP4 => "mp4",
-			Self::WEBM => "webm",
-			Self::OGG => "ogg",
-			Self::PDF => "pdf",
-			Self::ZIP => "zip",
-			Self::SevenZip => "7z",
-			Self::TGZ => "tar.gz",
-			Self::TXZ => "tar.xz",
-			Self::FLAC => "flac",
-			Self::TXT => "txt",
-			Self::RAR => "rar",
-			Self::CBZ => "cbz",
-			Self::CBR => "cbr",
-			Self::SVG => "svg",
-			Self::NoFile => "",
+			JPEG => "jpg",
+			PNG => "png",
+			GIF => "gif",
+			WEBP => "webp",
+			MP3 => "mp3",
+			MP4 => "mp4",
+			WEBM => "webm",
+			OGG => "ogg",
+			PDF => "pdf",
+			ZIP => "zip",
+			SevenZip => "7z",
+			TGZ => "tar.gz",
+			TXZ => "tar.xz",
+			FLAC => "flac",
+			TXT => "txt",
+			RAR => "rar",
+			CBZ => "cbz",
+			CBR => "cbr",
+			SVG => "svg",
+			NoFile => "",
 		}
 	}
 }
